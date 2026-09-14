@@ -35,7 +35,9 @@ app.use(express.json());
 const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
 const hasFrontend = fs.existsSync(FRONTEND_DIR);
 if (hasFrontend) {
-  app.use(express.static(FRONTEND_DIR));
+  app.use(express.static(FRONTEND_DIR, { extensions: ['html', 'htm'] }));
+  app.get('/login', (req, res) => res.sendFile(path.join(FRONTEND_DIR, 'login.html')));
+  app.get('/admin', (req, res) => res.sendFile(path.join(FRONTEND_DIR, 'admin.html')));
 }
 
 // Health check endpoint for cloud deployment (Render, Railway, Fly.io)
