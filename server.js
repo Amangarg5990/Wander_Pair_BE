@@ -6,6 +6,7 @@ const sqlite3 = require('sqlite3').verbose();
 const http = require('http');
 const WebSocket = require('ws');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -79,6 +80,16 @@ function initDatabase() {
         tripsCount INTEGER DEFAULT 0,
         rating REAL DEFAULT 4.9,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Sessions table for multi-user token authentication
+    db.run(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       )
     `);
 
@@ -686,12 +697,31 @@ wss.on('connection', (ws) => {
 });
 
 // ----------------------------------------------------
-// REST API ROUTES
+// REST API ROUTES - MULTI-USER TOKEN AUTHENTICATION
 // ----------------------------------------------------
 
-let currentSessionUser = undefined;
+// Session authentication helper: resolves Bearer token from SQLite sessions table
+function getAuthenticatedUser(req, callback) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return callback(null, null);
+  }
+  const token = authHeader.split(' ')[1];
+  if (!token) return callback(null, null);
 
-// Auth Login Route (Bcrypt Hash Comparison + Demo Accounts)
+  const query = `
+    SELECT users.id, users.name, users.email, users.role, users.avatar, users.bio, users.country, users.verified, users.kyc_verified, users.style, users.tripsCount, users.rating, users.created_at
+    FROM sessions
+    JOIN users ON sessions.user_id = users.id
+    WHERE sessions.token = ?
+  `;
+  db.get(query, [token], (err, user) => {
+    if (err || !user) return callback(null, null);
+    return callback(null, user, token);
+  });
+}
+
+// Auth Login Route (Generates isolated Bearer token for client)
 app.post('/api/auth/login', (req, res) => {
   const { email, password, role } = req.body;
 
@@ -734,12 +764,16 @@ app.post('/api/auth/login', (req, res) => {
       return res.status(401).json({ error: 'Invalid password. Please check your credentials.' });
     }
 
-    currentSessionUser = user;
-    res.json({ success: true, user });
+    // Generate unique session token for this client
+    const token = 'wp_' + crypto.randomBytes(32).toString('hex');
+    db.run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', [token, user.id], (sessionErr) => {
+      if (sessionErr) return res.status(500).json({ error: sessionErr.message });
+      res.json({ success: true, token, user });
+    });
   });
 });
 
-// Auth Register Route (Bcrypt Password Hashing)
+// Auth Register Route (Creates user and returns isolated session token)
 app.post('/api/auth/register', (req, res) => {
   const { name, email, password, role, city, bio } = req.body;
 
@@ -752,8 +786,8 @@ app.post('/api/auth/register', (req, res) => {
   const avatar = 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80';
   
   const query = `
-    INSERT INTO users (name, email, password, role, avatar, bio, country, verified, style)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+    INSERT INTO users (name, email, password, role, avatar, bio, country, verified, kyc_verified, style)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
   `;
 
   db.run(query, [name, email.trim().toLowerCase(), hashedPassword, userRole, avatar, bio || 'Solo explorer excited to travel.', city || 'India', 'Solo Explorer'], function(err) {
@@ -765,28 +799,32 @@ app.post('/api/auth/register', (req, res) => {
     }
     
     db.get('SELECT * FROM users WHERE id = ?', [this.lastID], (err2, newUser) => {
-      currentSessionUser = newUser;
-      res.json({ success: true, user: newUser });
+      if (err2 || !newUser) return res.status(500).json({ error: 'Failed to retrieve registered user' });
+      const token = 'wp_' + crypto.randomBytes(32).toString('hex');
+      db.run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', [token, newUser.id], (sessionErr) => {
+        if (sessionErr) return res.status(500).json({ error: sessionErr.message });
+        res.json({ success: true, token, user: newUser });
+      });
     });
   });
 });
 
-// Auth Logout Route
+// Auth Logout Route (Invalidates caller's session token)
 app.post('/api/auth/logout', (req, res) => {
-  currentSessionUser = null;
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split(' ')[1];
+    db.run('DELETE FROM sessions WHERE token = ?', [token], () => {});
+  }
   res.json({ success: true, message: 'Logged out successfully' });
 });
 
-// Get current session user (always fetched fresh from SQLite)
+// Get current session user (Resolved from client Bearer token)
 app.get('/api/users/me', (req, res) => {
-  if (currentSessionUser === null) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  const userId = (currentSessionUser && currentSessionUser.id) ? currentSessionUser.id : 1;
-  db.get('SELECT id, name, email, role, avatar, bio, country, verified, kyc_verified, style, tripsCount, rating, created_at FROM users WHERE id = ?', [userId], (err, user) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!user) return res.status(401).json({ error: 'User session not found' });
-    currentSessionUser = user;
+  getAuthenticatedUser(req, (err, user) => {
+    if (err || !user) {
+      return res.status(401).json({ error: 'Not authenticated', guest: true });
+    }
     res.json(user);
   });
 });
@@ -832,86 +870,90 @@ app.get('/api/explorers', (req, res) => {
 
 // POST Post a new Solo Explorer Status
 app.post('/api/explorers', (req, res) => {
-  const { city, area, activity_intent, date_time, status_text } = req.body;
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user) {
+      return res.status(401).json({ error: 'Please log in to share explorer status.' });
+    }
+    const { city, area, activity_intent, date_time, status_text } = req.body;
 
-  if (!city || !status_text) {
-    return res.status(400).json({ error: 'City and Status Description are required.' });
-  }
+    if (!city || !status_text) {
+      return res.status(400).json({ error: 'City and Status Description are required.' });
+    }
 
-  const userId = currentSessionUser ? currentSessionUser.id : 1;
+    const userId = user.id;
 
-  const query = `
-    INSERT INTO city_explorers (user_id, city, area, activity_intent, date_time, status_text)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `;
+    const query = `
+      INSERT INTO city_explorers (user_id, city, area, activity_intent, date_time, status_text)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `;
 
-  db.run(query, [userId, city, area || city, activity_intent || 'Exploring City', date_time || 'Today', status_text], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true, explorer_id: this.lastID });
+    db.run(query, [userId, city, area || city, activity_intent || 'Exploring City', date_time || 'Today', status_text], function(err2) {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ success: true, explorer_id: this.lastID });
+    });
   });
 });
 
 // Admin API: Get all registered users (Admin Portal access only)
 app.get('/api/admin/users', (req, res) => {
-  if (!currentSessionUser || currentSessionUser.role !== 'admin') {
-    return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
-  }
-  db.all('SELECT id, name, email, role, avatar, country, verified, kyc_verified, tripsCount, rating, created_at FROM users ORDER BY id DESC', [], (err, users) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(users);
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
+    }
+    db.all('SELECT id, name, email, role, avatar, country, verified, kyc_verified, tripsCount, rating, created_at FROM users ORDER BY id DESC', [], (err2, users) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json(users);
+    });
   });
 });
 
 // Admin API: Get all trips for moderation (Admin Portal access only)
 app.get('/api/admin/trips', (req, res) => {
-  if (!currentSessionUser || currentSessionUser.role !== 'admin') {
-    return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
-  }
-  db.all(`
-    SELECT trips.*, users.name as host_name, users.email as host_email, users.avatar as host_avatar
-    FROM trips
-    JOIN users ON trips.host_id = users.id
-    ORDER BY trips.id DESC
-  `, [], (err, trips) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(trips);
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
+    }
+    db.all(`
+      SELECT trips.*, users.name as host_name, users.email as host_email, users.avatar as host_avatar
+      FROM trips
+      JOIN users ON trips.host_id = users.id
+      ORDER BY trips.id DESC
+    `, [], (err2, trips) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json(trips);
+    });
   });
 });
 
 // Admin API: Delete trip (Admin Portal access only)
 app.delete('/api/admin/trips/:id', (req, res) => {
-  if (!currentSessionUser || currentSessionUser.role !== 'admin') {
-    return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
-  }
-  db.run('DELETE FROM trips WHERE id = ?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    db.run('DELETE FROM bookings WHERE trip_id = ?', [req.params.id]);
-    res.json({ success: true, deletedTripId: req.params.id });
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
+    }
+    db.run('DELETE FROM trips WHERE id = ?', [req.params.id], function(err2) {
+      if (err2) return res.status(500).json({ error: err2.message });
+      db.run('DELETE FROM bookings WHERE trip_id = ?', [req.params.id]);
+      res.json({ success: true, deletedTripId: req.params.id });
+    });
   });
 });
 
 // Admin API: Toggle user verification & KYC status (Admin Portal access only)
 app.patch('/api/admin/users/:id/verify', (req, res) => {
-  if (!currentSessionUser || currentSessionUser.role !== 'admin') {
-    return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
-  }
-  db.get('SELECT verified, kyc_verified FROM users WHERE id = ?', [req.params.id], (err, user) => {
-    if (err || !user) return res.status(404).json({ error: 'User not found.' });
-    const currentVal = (user.kyc_verified !== undefined && user.kyc_verified !== null) ? user.kyc_verified : user.verified;
-    const newStatus = currentVal === 1 ? 0 : 1;
-    db.run('UPDATE users SET verified = ?, kyc_verified = ? WHERE id = ?', [newStatus, newStatus, req.params.id], (err2) => {
-      if (err2) return res.status(500).json({ error: err2.message });
-
-      // Keep trips hosted by this user in sync
-      db.run('UPDATE trips SET kyc_verified = ? WHERE host_id = ?', [newStatus, req.params.id]);
-
-      // If active session belongs to this modified user, update in-memory object too
-      if (currentSessionUser && String(currentSessionUser.id) === String(req.params.id)) {
-        currentSessionUser.verified = newStatus;
-        currentSessionUser.kyc_verified = newStatus;
-      }
-
-      res.json({ success: true, userId: parseInt(req.params.id), verified: newStatus, kyc_verified: newStatus });
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access Denied: Admin Portal authentication required.' });
+    }
+    db.get('SELECT verified, kyc_verified FROM users WHERE id = ?', [req.params.id], (err2, targetUser) => {
+      if (err2 || !targetUser) return res.status(404).json({ error: 'User not found.' });
+      const currentVal = (targetUser.kyc_verified !== undefined && targetUser.kyc_verified !== null) ? targetUser.kyc_verified : targetUser.verified;
+      const newStatus = currentVal === 1 ? 0 : 1;
+      db.run('UPDATE users SET verified = ?, kyc_verified = ? WHERE id = ?', [newStatus, newStatus, req.params.id], (err3) => {
+        if (err3) return res.status(500).json({ error: err3.message });
+        db.run('UPDATE trips SET kyc_verified = ? WHERE host_id = ?', [newStatus, req.params.id]);
+        res.json({ success: true, userId: parseInt(req.params.id), verified: newStatus, kyc_verified: newStatus });
+      });
     });
   });
 });
@@ -961,24 +1003,29 @@ app.get('/api/outings', (req, res) => {
 
 // Post a new Inter-City Outing
 app.post('/api/outings', (req, res) => {
-  const { title, city, category, date_time, venue, estimated_cost, max_companions, cover_image, description } = req.body;
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user) {
+      return res.status(401).json({ error: 'Please log in to host a city outing.' });
+    }
+    const { title, city, category, date_time, venue, estimated_cost, max_companions, cover_image, description } = req.body;
 
-  if (!title || !city || !category) {
-    return res.status(400).json({ error: 'Title, City, and Category are required.' });
-  }
+    if (!title || !city || !category) {
+      return res.status(400).json({ error: 'Title, City, and Category are required.' });
+    }
 
-  const host_id = currentSessionUser ? currentSessionUser.id : 1;
-  const img = cover_image || 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=1200&q=80';
-  const maxComp = parseInt(max_companions) || 1;
+    const host_id = user.id;
+    const img = cover_image || 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=1200&q=80';
+    const maxComp = parseInt(max_companions) || 1;
 
-  const query = `
-    INSERT INTO city_outings (host_id, title, city, category, date_time, venue, estimated_cost, max_companions, spots_left, cover_image, description)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
+    const query = `
+      INSERT INTO city_outings (host_id, title, city, category, date_time, venue, estimated_cost, max_companions, spots_left, cover_image, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
 
-  db.run(query, [host_id, title, city, category, date_time || 'Upcoming', venue || '', parseFloat(estimated_cost) || 500, maxComp, maxComp, img, description || ''], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true, outing_id: this.lastID });
+    db.run(query, [host_id, title, city, category, date_time || 'Upcoming', venue || '', parseFloat(estimated_cost) || 500, maxComp, maxComp, img, description || ''], function(err2) {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ success: true, outing_id: this.lastID });
+    });
   });
 });
 
@@ -1102,66 +1149,76 @@ app.get('/api/compatibility', (req, res) => {
 
 // Post a new solo trip
 app.post('/api/trips', (req, res) => {
-  const { title, destination, country, start_date, end_date, style, budget, trip_type, estimated_cost, max_companions, cover_image, description, itinerary, gender_pref } = req.body;
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user) {
+      return res.status(401).json({ error: 'Please log in to post an expedition trip.' });
+    }
+    const { title, destination, country, start_date, end_date, style, budget, trip_type, estimated_cost, max_companions, cover_image, description, itinerary, gender_pref } = req.body;
 
-  if (!title || !destination) {
-    return res.status(400).json({ error: 'Title and Destination are required.' });
-  }
+    if (!title || !destination) {
+      return res.status(400).json({ error: 'Title and Destination are required.' });
+    }
 
-  const host_id = currentSessionUser ? currentSessionUser.id : 1;
-  const itinJson = JSON.stringify(itinerary || []);
-  const img = cover_image || 'https://images.unsplash.com/photo-1506461883276-594a12b11cf3?auto=format&fit=crop&w=1200&q=80';
-  const type = trip_type || (parseInt(max_companions) > 1 ? 'group' : 'pair');
+    const host_id = user.id;
+    const itinJson = JSON.stringify(itinerary || []);
+    const img = cover_image || 'https://images.unsplash.com/photo-1506461883276-594a12b11cf3?auto=format&fit=crop&w=1200&q=80';
+    const type = trip_type || (parseInt(max_companions) > 1 ? 'group' : 'pair');
 
-  const query = `
-    INSERT INTO trips (host_id, title, destination, country, start_date, end_date, style, budget, trip_type, estimated_cost, max_companions, spots_left, cover_image, description, itinerary, gender_pref)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
+    const query = `
+      INSERT INTO trips (host_id, title, destination, country, start_date, end_date, style, budget, trip_type, estimated_cost, max_companions, spots_left, cover_image, description, itinerary, gender_pref)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
 
-  const maxComp = parseInt(max_companions) || 1;
+    const maxComp = parseInt(max_companions) || 1;
 
-  db.run(query, [host_id, title, destination, country || 'India', start_date || '', end_date || '', style || 'Adventure', budget || 'Moderate', type, parseFloat(estimated_cost) || 12000, maxComp, maxComp, img, description || '', itinJson, gender_pref || 'Any'], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    
-    db.run('UPDATE users SET tripsCount = tripsCount + 1 WHERE id = ?', [host_id]);
-    res.json({ success: true, trip_id: this.lastID });
+    db.run(query, [host_id, title, destination, country || 'India', start_date || '', end_date || '', style || 'Adventure', budget || 'Moderate', type, parseFloat(estimated_cost) || 12000, maxComp, maxComp, img, description || '', itinJson, gender_pref || 'Any'], function(err2) {
+      if (err2) return res.status(500).json({ error: err2.message });
+      
+      db.run('UPDATE users SET tripsCount = tripsCount + 1 WHERE id = ?', [host_id]);
+      res.json({ success: true, trip_id: this.lastID });
+    });
   });
 });
 
 // Submit a companion booking request
 app.post('/api/bookings', (req, res) => {
-  const { trip_id, note } = req.body;
-  const requester_id = currentSessionUser ? currentSessionUser.id : 1;
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user) {
+      return res.status(401).json({ error: 'Please log in to send a companion request.' });
+    }
+    const { trip_id, note } = req.body;
+    const requester_id = user.id;
 
-  if (!trip_id) {
-    return res.status(400).json({ error: 'Trip ID is required.' });
-  }
-
-  db.get('SELECT estimated_cost, host_id, spots_left, max_companions FROM trips WHERE id = ?', [trip_id], (err, trip) => {
-    if (err || !trip) return res.status(404).json({ error: 'Trip not found.' });
-
-    if (trip.host_id === requester_id) {
-      return res.status(400).json({ error: 'You cannot book your own trip!' });
+    if (!trip_id) {
+      return res.status(400).json({ error: 'Trip ID is required.' });
     }
 
-    if (trip.spots_left <= 0) {
-      return res.status(400).json({ error: 'No companion spots remaining on this trip.' });
-    }
+    db.get('SELECT estimated_cost, host_id, spots_left, max_companions FROM trips WHERE id = ?', [trip_id], (err2, trip) => {
+      if (err2 || !trip) return res.status(404).json({ error: 'Trip not found.' });
 
-    db.get('SELECT id FROM bookings WHERE trip_id = ? AND requester_id = ?', [trip_id, requester_id], (err, existing) => {
-      if (existing) {
-        return res.status(400).json({ error: 'You have already sent a companion request for this trip.' });
+      if (trip.host_id === requester_id) {
+        return res.status(400).json({ error: 'You cannot book your own trip!' });
       }
 
-      db.get('SELECT COUNT(*) as acceptedCount FROM bookings WHERE trip_id = ? AND status = "accepted"', [], (err3, countRow) => {
-        const totalPeople = 1 + (countRow ? countRow.acceptedCount : 0) + 1;
-        const split = Math.round(trip.estimated_cost / totalPeople);
+      if (trip.spots_left <= 0) {
+        return res.status(400).json({ error: 'No companion spots remaining on this trip.' });
+      }
 
-        const query = `INSERT INTO bookings (trip_id, requester_id, note, estimated_split, status) VALUES (?, ?, ?, ?, 'pending')`;
+      db.get('SELECT id FROM bookings WHERE trip_id = ? AND requester_id = ?', [trip_id, requester_id], (err3, existing) => {
+        if (existing) {
+          return res.status(400).json({ error: 'You have already sent a companion request for this trip.' });
+        }
 
-        db.run(query, [trip_id, requester_id, note || 'Namaste! I would love to join your solo trip squad.', split], function(err2) {
-          if (err2) return res.status(500).json({ error: err2.message });
-          res.json({ success: true, booking_id: this.lastID, split });
+        db.get('SELECT COUNT(*) as acceptedCount FROM bookings WHERE trip_id = ? AND status = "accepted"', [], (err4, countRow) => {
+          const totalPeople = 1 + (countRow ? countRow.acceptedCount : 0) + 1;
+          const split = Math.round(trip.estimated_cost / totalPeople);
+
+          const query = `INSERT INTO bookings (trip_id, requester_id, note, estimated_split, status) VALUES (?, ?, ?, ?, 'pending')`;
+
+          db.run(query, [trip_id, requester_id, note || 'Namaste! I would love to join your solo trip squad.', split], function(err5) {
+            if (err5) return res.status(500).json({ error: err5.message });
+            res.json({ success: true, booking_id: this.lastID, split });
+          });
         });
       });
     });
@@ -1170,54 +1227,64 @@ app.post('/api/bookings', (req, res) => {
 
 // Get user bookings
 app.get('/api/bookings', (req, res) => {
-  const userId = currentSessionUser ? currentSessionUser.id : 1;
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user) {
+      return res.json({ sent: [], received: [] });
+    }
+    const userId = user.id;
 
-  const sentQuery = `
-    SELECT bookings.*, trips.title as trip_title, trips.destination, trips.cover_image, trips.start_date, trips.end_date, host.name as host_name, host.avatar as host_avatar
-    FROM bookings
-    JOIN trips ON bookings.trip_id = trips.id
-    JOIN users as host ON trips.host_id = host.id
-    WHERE bookings.requester_id = ?
-    ORDER BY bookings.created_at DESC
-  `;
+    const sentQuery = `
+      SELECT bookings.*, trips.title as trip_title, trips.destination, trips.cover_image, trips.start_date, trips.end_date, host.name as host_name, host.avatar as host_avatar
+      FROM bookings
+      JOIN trips ON bookings.trip_id = trips.id
+      JOIN users as host ON trips.host_id = host.id
+      WHERE bookings.requester_id = ?
+      ORDER BY bookings.created_at DESC
+    `;
 
-  const receivedQuery = `
-    SELECT bookings.*, trips.title as trip_title, trips.destination, trips.cover_image, requester.name as requester_name, requester.avatar as requester_avatar, requester.bio as requester_bio, requester.rating as requester_rating
-    FROM bookings
-    JOIN trips ON bookings.trip_id = trips.id
-    JOIN users as requester ON bookings.requester_id = requester.id
-    WHERE trips.host_id = ?
-    ORDER BY bookings.created_at DESC
-  `;
+    const receivedQuery = `
+      SELECT bookings.*, trips.title as trip_title, trips.destination, trips.cover_image, requester.name as requester_name, requester.avatar as requester_avatar, requester.bio as requester_bio, requester.rating as requester_rating
+      FROM bookings
+      JOIN trips ON bookings.trip_id = trips.id
+      JOIN users as requester ON bookings.requester_id = requester.id
+      WHERE trips.host_id = ?
+      ORDER BY bookings.created_at DESC
+    `;
 
-  db.all(sentQuery, [userId], (err, sent) => {
-    if (err) return res.status(500).json({ error: err.message });
-    db.all(receivedQuery, [userId], (err2, received) => {
+    db.all(sentQuery, [userId], (err2, sent) => {
       if (err2) return res.status(500).json({ error: err2.message });
-      res.json({ sent, received });
+      db.all(receivedQuery, [userId], (err3, received) => {
+        if (err3) return res.status(500).json({ error: err3.message });
+        res.json({ sent, received });
+      });
     });
   });
 });
 
 // Accept or Decline booking request
 app.patch('/api/bookings/:id', (req, res) => {
-  const { status } = req.body;
-  const bookingId = req.params.id;
+  getAuthenticatedUser(req, (err, user) => {
+    if (!user) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+    const { status } = req.body;
+    const bookingId = req.params.id;
 
-  if (!['accepted', 'declined'].includes(status)) {
-    return res.status(400).json({ error: 'Status must be accepted or declined.' });
-  }
+    if (!['accepted', 'declined'].includes(status)) {
+      return res.status(400).json({ error: 'Status must be accepted or declined.' });
+    }
 
-  db.get('SELECT * FROM bookings WHERE id = ?', [bookingId], (err, booking) => {
-    if (err || !booking) return res.status(404).json({ error: 'Booking request not found.' });
+    db.get('SELECT * FROM bookings WHERE id = ?', [bookingId], (err2, booking) => {
+      if (err2 || !booking) return res.status(404).json({ error: 'Booking request not found.' });
 
-    db.run('UPDATE bookings SET status = ? WHERE id = ?', [status, bookingId], (err2) => {
-      if (err2) return res.status(500).json({ error: err2.message });
+      db.run('UPDATE bookings SET status = ? WHERE id = ?', [status, bookingId], (err3) => {
+        if (err3) return res.status(500).json({ error: err3.message });
 
-      if (status === 'accepted') {
-        db.run('UPDATE trips SET spots_left = MAX(0, spots_left - 1) WHERE id = ?', [booking.trip_id]);
-      }
-      res.json({ success: true, status });
+        if (status === 'accepted') {
+          db.run('UPDATE trips SET spots_left = MAX(0, spots_left - 1) WHERE id = ?', [booking.trip_id]);
+        }
+        res.json({ success: true, status });
+      });
     });
   });
 });
