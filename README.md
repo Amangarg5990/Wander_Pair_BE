@@ -4,6 +4,16 @@ The backend engine for **WanderPair** — a solo traveler companion matching & g
 
 ---
 
+## 🌐 Live Deployment Links
+
+- **Live Backend API**: [https://wanderpair-backend.onrender.com](https://wanderpair-backend.onrender.com)
+- **Health Check Endpoint**: [https://wanderpair-backend.onrender.com/api/health](https://wanderpair-backend.onrender.com/api/health)
+- **Live Frontend App**: [https://wander-pair-fe.vercel.app](https://wander-pair-fe.vercel.app)
+- **Backend GitHub Repo**: [https://github.com/Amangarg5990/Wander_Pair_BE](https://github.com/Amangarg5990/Wander_Pair_BE)
+- **Frontend GitHub Repo**: [https://github.com/Amangarg5990/Wander_Pair_FE](https://github.com/Amangarg5990/Wander_Pair_FE)
+
+---
+
 ## 📁 Repository Structure
 
 ```
@@ -20,12 +30,12 @@ backend/
 
 ## ⚙️ Environment Variables
 
-Copy `.env.example` to `.env` if using local environment files, or set these in your cloud hosting environment:
+Copy `.env.example` to `.env` if using local environment files, or set these in your cloud hosting environment (e.g. Render Dashboard):
 
-| Variable | Default | Description |
+| Variable | Recommended Production Value | Description |
 | :--- | :--- | :--- |
-| `PORT` | `3000` | Port for the HTTP & WebSocket server (assigned automatically by cloud hosts). |
-| `FRONTEND_URL` | `*` | Comma-separated list of allowed frontend origins for CORS (e.g. `https://wanderpair.vercel.app`). |
+| `PORT` | `3000` | Port for HTTP & WebSocket server (assigned automatically by Render). |
+| `FRONTEND_URL` | `https://wander-pair-fe.vercel.app` | Allowed frontend origin for CORS security. |
 
 ---
 
@@ -47,7 +57,7 @@ The server will start listening at `http://localhost:3000`.
 ## 📡 REST API Reference
 
 ### Health & Monitoring
-- `GET /api/health` - Uptime and service status check.
+- `GET /api/health` - Uptime and service status check (`https://wanderpair-backend.onrender.com/api/health`).
 
 ### Authentication
 - `POST /api/auth/login` - Authenticate user (`{ email, password }`). Returns session user.
@@ -79,69 +89,28 @@ The server will start listening at `http://localhost:3000`.
 
 ## 💬 Real-Time WebSocket Live Chat
 
-The WebSocket server runs on the same port as the HTTP server (`server.listen(PORT)`):
-- **Protocol**: Standard WebSocket (`ws://` or `wss://`).
-- **Connection URL**: `ws://<your-backend-host>` or `wss://<your-backend-host>`.
+The WebSocket server runs attached to the HTTP server:
+- **Protocol**: Standard WebSocket (`wss://`).
+- **Live Endpoint**: `wss://wanderpair-backend.onrender.com`
 - **Message Types**:
-  - `join`: Join a specific trip or chat room (`{ type: 'join', room: 'trip-101', user: { name: 'Aarav' } }`).
-  - `message`: Broadcast message to all active companions in room (`{ type: 'message', room: 'trip-101', text: 'Hey squad!' }`).
-  - `history`: Server automatically emits the latest chat log upon joining a room.
+  - `join`: Join a trip room (`{ type: 'join', room: 'trip-101', user: { name: 'Aarav' } }`).
+  - `message`: Broadcast message to companions (`{ type: 'message', room: 'trip-101', text: 'Hey squad!' }`).
+  - `history`: Automatically delivers latest chat log upon joining.
 
 ---
 
-## ☁️ Deployment Guide
+## ☁️ Deployment Reference (Render.com)
 
-### Option 1: Deploy on Render.com (Recommended)
-1. Push this `backend/` folder to a new GitHub repository (e.g. `wanderpair-backend`).
-2. Log in to [Render.com](https://render.com/) and click **New +** $\rightarrow$ **Web Service**.
-3. Connect your `wanderpair-backend` repository.
-4. Configure settings:
-   - **Environment**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `node server.js`
-   - **Health Check Path**: `/api/health`
-5. Under **Environment Variables**, set:
-   - `FRONTEND_URL`: `https://your-frontend.vercel.app` (or `*`)
-6. *(Optional for persistent SQLite)*: Add a **Disk** under `Disks` mounted to `/data`, and adjust `dbPath` if preserving data between server restarts.
-
-### Option 2: Deploy on Railway.app
-1. Push `backend/` to a GitHub repository.
-2. Log in to [Railway.app](https://railway.app/) and create a **New Project from GitHub Repo**.
-3. Railway automatically detects `package.json` and runs `npm start`.
-4. Add environment variable `FRONTEND_URL` pointing to your frontend URL.
-
-### Option 3: Deploy on Fly.io
-1. Install Fly CLI: `flyctl auth login`.
-2. In the `backend/` directory, run:
-   ```bash
-   fly launch
-   ```
-3. Deploy:
-   ```bash
-   fly deploy
-   ```
+This backend is actively deployed on **Render**:
+1. Repository: [https://github.com/Amangarg5990/Wander_Pair_BE](https://github.com/Amangarg5990/Wander_Pair_BE)
+2. Build Command: `npm install`
+3. Start Command: `node server.js`
+4. Health Check Path: `/api/health`
+5. Environment Variable:
+   - `FRONTEND_URL`: `https://wander-pair-fe.vercel.app`
 
 ---
 
-## 📦 How to Push to GitHub as a Dedicated Repository
+## 🔗 Related Repositories
 
-To push only this backend folder as a separate GitHub repository:
-
-```bash
-# Navigate into backend directory
-cd backend
-
-# Initialize Git
-git init
-
-# Add and commit files
-git add .
-git commit -m "feat: initial commit for WanderPair backend API & WebSocket server"
-
-# Link to your new GitHub repository
-git branch -M main
-git remote add origin https://github.com/<your-username>/wanderpair-backend.git
-
-# Push to GitHub
-git push -u origin main
-```
+- **Frontend Client Application**: [Amangarg5990/Wander_Pair_FE](https://github.com/Amangarg5990/Wander_Pair_FE)
